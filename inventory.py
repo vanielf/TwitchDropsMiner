@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import re
+import math
 from itertools import chain
 from typing import TYPE_CHECKING
 from functools import cached_property
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from channel import Channel
+from exceptions import GQLException
 from constants import GQL_OPERATIONS, URLType
 from utils import timestamp, invalidate_cache, Game
 
@@ -80,38 +82,59 @@ class BaseDrop:
         return f"Drop({self.rewards_text()}{additional})"
 
     @cached_property
-    def preconditions(self) -> bool:
+    def preconditions_met(self) -> bool:
         campaign = self.campaign
         return all(campaign.timed_drops[pid].is_claimed for pid in self._precondition_drops)
 
-    def _base_can_earn(self) -> bool:
+    def _base_earn_conditions(self) -> bool:
+        # define when a drop can be earned or not
         return (
-            self.preconditions  # preconditions are met
+            self.preconditions_met  # preconditions are met
             and not self.is_claimed  # isn't already claimed
+        )
+
+    def _base_can_earn(self) -> bool:
+        # cross-participates in can_earn and can_earn_within handling, where a timeframe is added
+        return (
+            self._base_earn_conditions()
             # is within the timeframe
             and self.starts_at <= datetime.now(timezone.utc) < self.ends_at
         )
 
     def can_earn(self, channel: Channel | None = None) -> bool:
-        return self.campaign._base_can_earn(channel) and self._base_can_earn()
+        return self._base_can_earn() and self.campaign._base_can_earn(channel)
 
     def can_earn_within(self, stamp: datetime) -> bool:
         return (
-            self.preconditions  # preconditions are met
-            and not self.is_claimed  # isn't already claimed
+            self._base_earn_conditions()
             and self.ends_at > datetime.now(timezone.utc)
             and self.starts_at < stamp
         )
 
     @property
     def can_claim(self) -> bool:
-        return self.claim_id is not None
+        # https://help.twitch.tv/s/article/mission-based-drops?language=en_US#claiming
+        # "If you are unable to claim the Drop in time, you will be able to claim it
+        # from the Drops Inventory page until 24 hours after the Drops campaign has ended."
+        return (
+            self.claim_id is not None
+            and not self.is_claimed
+            and datetime.now(timezone.utc) < self.campaign.ends_at + timedelta(hours=24)
+        )
 
     def _on_claim(self) -> None:
-        invalidate_cache(self, "preconditions")
+        invalidate_cache(self, "preconditions_met")
 
     def update_claim(self, claim_id: str):
         self.claim_id = claim_id
+
+    async def generate_claim(self) -> None:
+        # claim IDs now appear to be constructed from other IDs we have access to
+        # Format: UserID#CampaignID#DropID
+        # NOTE: This marks a drop as a ready-to-claim, so we may want to later ensure
+        # its mining progress is finished first
+        auth_state = await self.campaign._twitch.get_auth()
+        self.claim_id = f"{auth_state.user_id}#{self.campaign.id}#{self.id}"
 
     def rewards_text(self, delim: str = ", ") -> str:
         return delim.join(benefit.name for benefit in self.benefits)
@@ -133,11 +156,16 @@ class BaseDrop:
             return True
         if not self.can_claim:
             return False
-        response = await self._twitch.gql_request(
-            GQL_OPERATIONS["ClaimDrop"].with_variables(
-                {"input": {"dropInstanceID": self.claim_id}}
+        try:
+            response = await self._twitch.gql_request(
+                GQL_OPERATIONS["ClaimDrop"].with_variables(
+                    {"input": {"dropInstanceID": self.claim_id}}
+                )
             )
-        )
+        except GQLException:
+            # regardless of the error, we have to assume
+            # the claiming operation has potentially failed
+            return False
         data = response["data"]
         if "errors" in data and data["errors"]:
             return False
@@ -159,12 +187,10 @@ class TimedDrop(BaseDrop):
         super().__init__(campaign, data, claimed_benefits)
         self._manager: GUIManager = self._twitch.gui
         self._gui_inv: InventoryOverview = self._manager.inv
-        self.current_minutes: int = 0
-        if "self" in data:
-            self.current_minutes = data["self"]["currentMinutesWatched"]
+        self.current_minutes: int = "self" in data and data["self"]["currentMinutesWatched"] or 0
         self.required_minutes: int = data["requiredMinutesWatched"]
         if self.is_claimed:
-            # claimed drops report 0 current minutes, so we need to make a correction
+            # claimed drops may report inconsistent current minutes, so we need to overwrite them
             self.current_minutes = self.required_minutes
 
     def __repr__(self) -> str:
@@ -185,8 +211,42 @@ class TimedDrop(BaseDrop):
         return self.required_minutes - self.current_minutes
 
     @cached_property
+    def total_required_minutes(self) -> int:
+        return self.required_minutes + max(
+            (
+                self.campaign.timed_drops[pid].total_required_minutes
+                for pid in self._precondition_drops
+            ),
+            default=0,
+        )
+
+    @cached_property
+    def total_remaining_minutes(self) -> int:
+        return self.remaining_minutes + max(
+            (
+                self.campaign.timed_drops[pid].total_remaining_minutes
+                for pid in self._precondition_drops
+            ),
+            default=0,
+        )
+
+    @cached_property
     def progress(self) -> float:
+        if self.current_minutes <= 0 or self.required_minutes <= 0:
+            return 0.0
+        elif self.current_minutes >= self.required_minutes:
+            return 1.0
         return self.current_minutes / self.required_minutes
+
+    @property
+    def availability(self) -> float:
+        now = datetime.now(timezone.utc)
+        if self.required_minutes > 0 and self.total_remaining_minutes > 0 and now < self.ends_at:
+            return ((self.ends_at - now).total_seconds() / 60) / self.total_remaining_minutes
+        return math.inf
+
+    def _base_earn_conditions(self) -> bool:
+        return super()._base_earn_conditions() and self.required_minutes > 0
 
     def _on_claim(self) -> None:
         result = super()._on_claim()
@@ -198,6 +258,9 @@ class TimedDrop(BaseDrop):
         self.campaign._on_minutes_changed()
         self._gui_inv.update_drop(self)
 
+    def _on_total_minutes_changed(self) -> None:
+        invalidate_cache(self, "total_required_minutes", "total_remaining_minutes")
+
     async def claim(self) -> bool:
         result = await super().claim()
         if result:
@@ -205,8 +268,14 @@ class TimedDrop(BaseDrop):
         return result
 
     def update_minutes(self, minutes: int):
-        self.current_minutes = minutes
+        if minutes < 0:
+            return
+        elif minutes <= self.required_minutes:
+            self.current_minutes = minutes
+        else:
+            self.current_minutes = self.required_minutes
         self._on_minutes_changed()
+        self.display()
 
     def display(self, *, countdown: bool = True, subone: bool = False):
         self._manager.display_drop(self, countdown=countdown, subone=subone)
@@ -215,6 +284,7 @@ class TimedDrop(BaseDrop):
         if self.current_minutes < self.required_minutes:
             self.current_minutes += 1
             self._on_minutes_changed()
+        self.display()
 
 
 class DropsCampaign:
@@ -285,12 +355,20 @@ class DropsCampaign:
         return sum(not d.is_claimed for d in self.drops)
 
     @cached_property
+    def required_minutes(self) -> int:
+        return max(d.total_required_minutes for d in self.drops)
+
+    @cached_property
     def remaining_minutes(self) -> int:
-        return sum(d.remaining_minutes for d in self.drops)
+        return max(d.total_remaining_minutes for d in self.drops)
 
     @cached_property
     def progress(self) -> float:
         return sum(d.progress for d in self.drops) / self.total_drops
+
+    @property
+    def availability(self) -> float:
+        return min(d.availability for d in self.drops)
 
     def _on_claim(self) -> None:
         invalidate_cache(self, "finished", "claimed_drops", "remaining_drops")
@@ -298,7 +376,9 @@ class DropsCampaign:
             drop._on_claim()
 
     def _on_minutes_changed(self) -> None:
-        invalidate_cache(self, "progress", "remaining_minutes")
+        invalidate_cache(self, "progress", "required_minutes", "remaining_minutes")
+        for drop in self.drops:
+            drop._on_total_minutes_changed()
 
     def get_drop(self, drop_id: str) -> TimedDrop | None:
         return self.timed_drops.get(drop_id)

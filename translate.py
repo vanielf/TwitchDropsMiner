@@ -130,7 +130,7 @@ class GUIChannels(TypedDict):
 class GUIInvFilter(TypedDict):
     name: str
     show: str
-    linked: str
+    not_linked: str
     upcoming: str
     expired: str
     excluded: str
@@ -165,12 +165,19 @@ class GUISettingsGeneral(TypedDict):
     autostart: str
     tray: str
     tray_notifications: str
-    priority_only: str
+    priority_mode: str
     proxy: str
+
+
+class GUIPriorityModes(TypedDict):
+    priority_only: str
+    ending_soonest: str
+    low_availability: str
 
 
 class GUISettings(TypedDict):
     general: GUISettingsGeneral
+    priority_modes: GUIPriorityModes
     game_name: str
     priority: str
     exclude: str
@@ -208,6 +215,7 @@ class GUIMessages(TypedDict):
 
 class Translation(TypedDict):
     language_name: NotRequired[str]
+    english_name: str
     status: StatusMessages
     login: LoginMessages
     error: ErrorMessages
@@ -215,6 +223,7 @@ class Translation(TypedDict):
 
 
 default_translation: Translation = {
+    "english_name": "English",
     "status": {
         "terminated": "\nApplication Terminated.\nClose the window to exit the application.",
         "watching": "Watching: {channel}",
@@ -238,7 +247,7 @@ default_translation: Translation = {
             ),
             "no_token": "No authorization token could be found.",
             "closed_window": (
-                "Chrome window was closed before the login procedure could complete."
+                "The Chrome window was closed before the login procedure could be completed."
             ),
         },
         "error_code": "Login error code: {error_code}",
@@ -330,7 +339,7 @@ default_translation: Translation = {
             "filter": {
                 "name": "Filter",
                 "show": "Show:",
-                "linked": "Linked only",
+                "not_linked": "Not linked",
                 "upcoming": "Upcoming",
                 "expired": "Expired",
                 "excluded": "Excluded",
@@ -360,8 +369,13 @@ default_translation: Translation = {
                 "autostart": "Autostart: ",
                 "tray": "Autostart into tray: ",
                 "tray_notifications": "Tray notifications: ",
-                "priority_only": "Priority Only: ",
+                "priority_mode": "Priority mode: ",
                 "proxy": "Proxy (requires restart):",
+            },
+            "priority_modes": {
+                "priority_only": "Priority list only",
+                "ending_soonest": "Ending soonest",
+                "low_availability": "Low availability first",
             },
             "game_name": "Game name",
             "priority": "Priority",
@@ -377,30 +391,33 @@ default_translation: Translation = {
             },
             "how_it_works": "How It Works",
             "how_it_works_text": (
-                "Every ~60 seconds, the application sends a \"minute watched\" event "
-                "to the channel that's currently being watched - this is enough "
-                "to advance the drops. Note that this completely bypasses the need to download "
-                "any actual stream video and sound. "
+                "Every several seconds, the application pretends to watch a particular stream "
+                "by fetching stream metadata - this is enough to advance the drops. "
+                "Note that this completely bypasses the need to download "
+                "any actual stream of video and sound. "
                 "To keep the status (ONLINE or OFFLINE) of the channels up-to-date, "
-                "there's a websocket connection estabilished that receives events about streams "
-                "going up or down, or updates regarding the current amount of viewers."
+                "there's a websocket connection established that receives events about streams "
+                "going up or down, or updates regarding the current number of viewers."
             ),
             "getting_started": "Getting Started",
             "getting_started_text": (
-                "1. Login into the application.\n"
+                "1. Login to the application.\n"
                 "2. Ensure your Twitch account is linked to all campaigns "
                 "you're interested in mining.\n"
-                "3. If you're interested in just mining everything, "
-                "uncheck \"Priority only\" and press on \"Reload\".\n"
+                "3. If you're interested in mining everything possible, "
+                "change the Priority Mode to anything other than \"Priority list only\" "
+                "and press on \"Reload\".\n"
                 "4. If you want to mine specific games first, use the \"Priority\" list "
-                "to setup an ordered list of games of your choice. Games from the top of the list "
-                "will be attempted to be mined first, before the ones lower down the list.\n"
-                "5. Keep the \"Priority only\" option checked, to avoid mining games "
-                "that are not on the priority list. Or not - it's up to you.\n"
+                "to set up an ordered list of games of your choice. "
+                "Games from the top of the list will be attempted to be mined first, "
+                "before the ones lower down the list.\n"
+                "5. Keep the \"Priority mode\" selected as \"Priority list only\", "
+                "to avoid mining games that are not on the priority list. "
+                "Or not - it's up to you.\n"
                 "6. Use the \"Exclude\" list to tell the application "
                 "which games should never be mined.\n"
-                "7. Changing the contents of either of the lists, or changing the state "
-                "of the \"Priority only\" option, requires you to press on \"Reload\" "
+                "7. Changing the contents of either of the lists, or changing "
+                "the \"Priority mode\", requires you to press on \"Reload\" "
                 "for the changes to take an effect."
             ),
         },

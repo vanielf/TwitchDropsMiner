@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import sys
+import platform
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-SELF_PATH = str(Path(".").absolute())
+SELF_PATH = str(Path(".").resolve())
 if SELF_PATH not in sys.path:
     sys.path.insert(0, SELF_PATH)
 
@@ -15,9 +16,15 @@ if TYPE_CHECKING:
     from PyInstaller.building.api import PYZ, EXE
     from PyInstaller.building.build_main import Analysis
 
+
 # (source_path, dest_path, required)
 to_add: list[tuple[Path, str, bool]] = [
-    (Path("pickaxe.ico"), '.', True),  # icon file
+    # icon files
+    (Path("icons/pickaxe.ico"), "./icons", True),
+    (Path("icons/active.ico"), "./icons", True),
+    (Path("icons/idle.ico"), "./icons", True),
+    (Path("icons/error.ico"), "./icons", True),
+    (Path("icons/maint.ico"), "./icons", True),
     # SeleniumWire HTTPS/SSL cert file and key
     (Path(SITE_PACKAGES_PATH, "seleniumwire/ca.crt"), "./seleniumwire", False),
     (Path(SITE_PACKAGES_PATH, "seleniumwire/ca.key"), "./seleniumwire", False),
@@ -26,7 +33,7 @@ for lang_filepath in WORKING_DIR.joinpath("lang").glob("*.json"):
     if lang_filepath.stem != DEFAULT_LANG:
         to_add.append((lang_filepath, "lang", True))
 
-# ensure the required to-be-added data exists
+# Ensure the required to-be-added data exists
 datas: list[tuple[Path, str]] = []
 for source_path, dest_path, required in to_add:
     if source_path.exists():
@@ -46,8 +53,15 @@ hiddenimports: list[str] = [
 
 if sys.platform == "linux":
     # Needed files for better system tray support on Linux via pystray (AppIndicator backend).
-    datas.append((Path("/usr/lib/girepository-1.0/AppIndicator3-0.1.typelib"), "gi_typelibs"))
-    binaries.append((Path("/lib/x86_64-linux-gnu/libappindicator3.so.1"), "."))
+    arch = platform.machine()
+    datas.append(
+        (
+            Path(f"/usr/lib/{arch}-linux-gnu/girepository-1.0/AyatanaAppIndicator3-0.1.typelib"),
+            "gi_typelibs",
+        )
+    )
+    binaries.append((Path(f"/usr/lib/{arch}-linux-gnu/libayatana-appindicator3.so.1"), "."))
+
     hiddenimports.extend([
         "gi.repository.Gtk",
         "gi.repository.GObject",
@@ -76,6 +90,15 @@ a = Analysis(
     win_private_assemblies=False,
     win_no_prefer_redirects=False,
 )
+
+# Exclude unneeded Linux libraries
+excluded_binaries = [
+    "libicudata.so.66",
+    "libicuuc.so.66",
+    "librsvg-2.so.2"
+]
+a.binaries = [b for b in a.binaries if b[0] not in excluded_binaries]
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz,
@@ -90,10 +113,10 @@ exe = EXE(
     console=False,
     upx_exclude=[],
     target_arch=None,
-    icon="pickaxe.ico",
     runtime_tmpdir=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon="icons/pickaxe.ico",
     bootloader_ignore_signals=False,
     disable_windowed_traceback=False,
     name="Twitch Drops Miner (by DevilXD)",

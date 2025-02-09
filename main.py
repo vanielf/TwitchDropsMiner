@@ -18,22 +18,21 @@ if __name__ == "__main__":
     from tkinter import messagebox
     from typing import IO, NoReturn
 
-    if sys.platform == "win32":
-        import win32gui
-
-    if sys.platform == "linux" and sys.version_info >= (3, 10):
-        import truststore
-        truststore.inject_into_ssl()
+    import truststore
+    truststore.inject_into_ssl()
 
     from translate import _
     from twitch import Twitch
     from settings import Settings
     from version import __version__
     from exceptions import CaptchaRequired
-    from utils import resource_path, set_root_icon
-    from constants import CALL, SELF_PATH, FILE_FORMATTER, LOG_PATH, WINDOW_TITLE
+    from utils import lock_file, resource_path, set_root_icon
+    from constants import LOGGING_LEVELS, SELF_PATH, FILE_FORMATTER, LOG_PATH, LOCK_PATH
 
     warnings.simplefilter("default", ResourceWarning)
+
+    if sys.version_info < (3, 10):
+        raise RuntimeError("Python 3.10 or higher is required")
 
     class Parser(argparse.ArgumentParser):
         def __init__(self, *args, **kwargs) -> None:
@@ -56,18 +55,12 @@ if __name__ == "__main__":
         _debug_gql: bool
         log: bool
         tray: bool
-        no_run_check: bool
+        dump: bool
 
         # TODO: replace int with union of literal values once typeshed updates
         @property
         def logging_level(self) -> int:
-            return {
-                0: logging.ERROR,
-                1: logging.WARNING,
-                2: logging.INFO,
-                3: CALL,
-                4: logging.DEBUG,
-            }[min(self._verbose, 3)]
+            return LOGGING_LEVELS[min(self._verbose, 4)]
 
         @property
         def debug_ws(self) -> int:
@@ -78,7 +71,7 @@ if __name__ == "__main__":
             """
             if self._debug_ws:
                 return logging.DEBUG
-            elif self._verbose >= 3:
+            elif self._verbose >= 4:
                 return logging.INFO
             return logging.NOTSET
 
@@ -86,7 +79,7 @@ if __name__ == "__main__":
         def debug_gql(self) -> int:
             if self._debug_gql:
                 return logging.DEBUG
-            elif self._verbose >= 3:
+            elif self._verbose >= 4:
                 return logging.INFO
             return logging.NOTSET
 
@@ -96,7 +89,7 @@ if __name__ == "__main__":
     root = tk.Tk()
     root.overrideredirect(True)
     root.withdraw()
-    set_root_icon(root, resource_path("pickaxe.ico"))
+    set_root_icon(root, resource_path("icons/pickaxe.ico"))
     root.update()
     parser = Parser(
         SELF_PATH.name,
@@ -106,10 +99,8 @@ if __name__ == "__main__":
     parser.add_argument("-v", dest="_verbose", action="count", default=0)
     parser.add_argument("--tray", action="store_true")
     parser.add_argument("--log", action="store_true")
+    parser.add_argument("--dump", action="store_true")
     # undocumented debug args
-    parser.add_argument(
-        "--no-run-check", dest="no_run_check", action="store_true", help=argparse.SUPPRESS
-    )
     parser.add_argument(
         "--debug-ws", dest="_debug_ws", action="store_true", help=argparse.SUPPRESS
     )
@@ -131,71 +122,75 @@ if __name__ == "__main__":
     # get rid of unneeded objects
     del root, parser
 
-    # check if we're not already running
-    if sys.platform == "win32":
+    # client run
+    async def main():
+        # set language
         try:
-            exists = win32gui.FindWindow(None, WINDOW_TITLE)
-        except AttributeError:
-            # we're not on Windows - continue
-            exists = False
-        if exists and not settings.no_run_check:
+            _.set_language(settings.language)
+        except ValueError:
+            # this language doesn't exist - stick to English
+            pass
+
+        # handle logging stuff
+        if settings.logging_level > logging.DEBUG:
+            # redirect the root logger into a NullHandler, effectively ignoring all logging calls
+            # that aren't ours. This always runs, unless the main logging level is DEBUG or lower.
+            logging.getLogger().addHandler(logging.NullHandler())
+        logger = logging.getLogger("TwitchDrops")
+        logger.setLevel(settings.logging_level)
+        if settings.log:
+            handler = logging.FileHandler(LOG_PATH)
+            handler.setFormatter(FILE_FORMATTER)
+            logger.addHandler(handler)
+        logging.getLogger("TwitchDrops.gql").setLevel(settings.debug_gql)
+        logging.getLogger("TwitchDrops.websocket").setLevel(settings.debug_ws)
+
+        exit_status = 0
+        client = Twitch(settings)
+        loop = asyncio.get_running_loop()
+        if sys.platform == "linux":
+            loop.add_signal_handler(signal.SIGINT, lambda *_: client.gui.close())
+            loop.add_signal_handler(signal.SIGTERM, lambda *_: client.gui.close())
+        try:
+            await client.run()
+        except CaptchaRequired:
+            exit_status = 1
+            client.prevent_close()
+            client.print(_("error", "captcha"))
+        except Exception:
+            exit_status = 1
+            client.prevent_close()
+            client.print("Fatal error encountered:\n")
+            client.print(traceback.format_exc())
+        finally:
+            if sys.platform == "linux":
+                loop.remove_signal_handler(signal.SIGINT)
+                loop.remove_signal_handler(signal.SIGTERM)
+            client.print(_("gui", "status", "exiting"))
+            await client.shutdown()
+        if not client.gui.close_requested:
+            # user didn't request the closure
+            client.gui.tray.change_icon("error")
+            client.print(_("status", "terminated"))
+            client.gui.status.update(_("gui", "status", "terminated"))
+            # notify the user about the closure
+            client.gui.grab_attention(sound=True)
+        await client.gui.wait_until_closed()
+        # save the application state
+        # NOTE: we have to do it after wait_until_closed,
+        # because the user can alter some settings between app termination and closing the window
+        client.save(force=True)
+        client.gui.stop()
+        client.gui.close_window()
+        sys.exit(exit_status)
+
+    try:
+        # use lock_file to check if we're not already running
+        success, file = lock_file(LOCK_PATH)
+        if not success:
             # already running - exit
             sys.exit(3)
 
-    # set language
-    try:
-        _.set_language(settings.language)
-    except ValueError:
-        # this language doesn't exist - stick to English
-        pass
-
-    # handle logging stuff
-    if settings.logging_level > logging.DEBUG:
-        # redirect the root logger into a NullHandler, effectively ignoring all logging calls
-        # that aren't ours. This always runs, unless the main logging level is DEBUG or lower.
-        logging.getLogger().addHandler(logging.NullHandler())
-    logger = logging.getLogger("TwitchDrops")
-    logger.setLevel(settings.logging_level)
-    if settings.log:
-        handler = logging.FileHandler(LOG_PATH)
-        handler.setFormatter(FILE_FORMATTER)
-        logger.addHandler(handler)
-    logging.getLogger("TwitchDrops.gql").setLevel(settings.debug_gql)
-    logging.getLogger("TwitchDrops.websocket").setLevel(settings.debug_ws)
-
-    # client run
-    exit_status = 0
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    client = Twitch(settings)
-    signal.signal(signal.SIGINT, lambda *_: client.gui.close())
-    signal.signal(signal.SIGTERM, lambda *_: client.gui.close())
-    try:
-        loop.run_until_complete(client.run())
-    except CaptchaRequired:
-        exit_status = 1
-        client.prevent_close()
-        client.print(_("error", "captcha"))
-    except Exception:
-        exit_status = 1
-        client.prevent_close()
-        client.print("Fatal error encountered:\n")
-        client.print(traceback.format_exc())
+        asyncio.run(main())
     finally:
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        client.print(_("gui", "status", "exiting"))
-        loop.run_until_complete(client.shutdown())
-    if not client.gui.close_requested:
-        client.print(_("status", "terminated"))
-        client.gui.status.update(_("gui", "status", "terminated"))
-    loop.run_until_complete(client.gui.wait_until_closed())
-    # save the application state
-    # NOTE: we have to do it after wait_until_closed,
-    # because the user can alter some settings between app termination and closing the window
-    client.save(force=True)
-    client.gui.stop()
-    client.gui.close_window()
-    loop.run_until_complete(loop.shutdown_asyncgens())
-    loop.close()
-    sys.exit(exit_status)
+        file.close()

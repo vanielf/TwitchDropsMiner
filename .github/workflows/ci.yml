@@ -2,17 +2,53 @@ name: Build
 
 on:
   push:
+    branches:
+      - 'master'
   pull_request:
   workflow_dispatch:
 
+env:
+  PYTHON_VERSION: '3.10'
+
 jobs:
-  windows:
-    name: Windows
-    runs-on: windows-2022
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{env.PYTHON_VERSION}}
+
+      - name: Validate language files
+        run: |
+          failed=()
+          for file in "lang/"*.json; do
+            if err="$(python -m json.tool "${file}" 2>&1 >/dev/null)"; then
+              echo "[OK] ${file}"
+            else
+              echo "[ERROR] ${file} ${err}"
+              failed+=("${file}")
+            fi
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo -e "\nFailed to validate the following language file(s): ${failed[@]}"
+            exit 1
+          fi
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    needs:
+      - validate
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Set up variables
         id: vars
@@ -22,17 +58,19 @@ jobs:
       - name: Append git revision to project version
         run: |
           (Get-Content version.py) `
-          -Replace '^__version__\s*=\s*"[^"]+', "`$0.${{ steps.vars.outputs.sha_short }}" |`
+          -Replace '^__version__\s*=\s*"[^"]+', "`$0.${{steps.vars.outputs.sha_short}}" |`
           Out-File version.py
 
-      - name: Set up Python virtual environment
-        run: |
-          python3 -m venv env
+      # Ensure Python version
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{env.PYTHON_VERSION}}
 
       - name: Install project dependencies
         run: |
-          .\env\Scripts\activate
-          python3 -m pip install wheel -r requirements.txt
+          python3 -m pip install wheel
+          python3 -m pip install -r requirements.txt
 
       - name: Install UPX
         run: |
@@ -43,12 +81,10 @@ jobs:
 
       - name: Install PyInstaller
         run: |
-          .\env\Scripts\activate
           python3 -m pip install pyinstaller
 
       - name: Create portable executable
         run: |
-          .\env\Scripts\activate
           pyinstaller build.spec
 
       - name: Create release folder
@@ -60,19 +96,21 @@ jobs:
           Compress-Archive -Path $FolderName -DestinationPath Twitch.Drops.Miner.Windows.zip
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           if-no-files-found: error
           name: Twitch.Drops.Miner.Windows
           path: Twitch.Drops.Miner.Windows.zip
 
-  linux:
-    name: Linux
+  linux-pyinstaller:
+    name: Linux (PyInstaller)
     runs-on: ubuntu-20.04
+    needs:
+      - validate
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up variables
         id: vars
@@ -81,31 +119,26 @@ jobs:
 
       - name: Append git revision to project version
         run: |
-          sed -ri "s/^__version__\s*=\s*\"[^\"]+/\0.${{ steps.vars.outputs.sha_short }}/" version.py
+          sed -ri "s/^__version__\s*=\s*\"[^\"]+/\0.${{steps.vars.outputs.sha_short}}/" version.py
 
       # NOTE: We're only use a custom version of Python here because truststore requires at least Python 3.10, but Ubuntu 20.04 has Python 3.8.
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: ${{env.PYTHON_VERSION}}
 
       - name: Install system dependencies
         run: |
           sudo apt update
-          sudo apt install gir1.2-appindicator3-0.1 libgirepository1.0-dev python3-tk
-
-      - name: Set up Python virtual environment
-        run: |
-          python3 -m venv env
+          sudo apt install libgirepository1.0-dev gir1.2-ayatanaappindicator3-0.1 libayatana-appindicator3-1 python3-tk
 
       - name: Install project dependencies
         run: |
-          source ./env/bin/activate
-          python3 -m pip install wheel -r requirements.txt
+          python3 -m pip install wheel
+          python3 -m pip install -r requirements.txt
 
       - name: Install PyInstaller
         run: |
-          source ./env/bin/activate
           python3 -m pip install pyinstaller
 
       # NOTE: Remove this step if/once libxft gets updated to 2.3.5 or newer on Ubuntu 20.04, which currently has 2.3.3.
@@ -122,7 +155,6 @@ jobs:
 
       - name: Create portable executable
         run: |
-          source ./env/bin/activate
           LD_LIBRARY_PATH=/tmp/libXft/lib xvfb-run --auto-servernum pyinstaller build.spec
 
       - name: Show PyInstaller warnings
@@ -134,22 +166,75 @@ jobs:
           folder='Twitch Drops Miner'
           mkdir "${folder}"
           cp manual.txt dist/* "${folder}"
-          7z a Twitch.Drops.Miner.Linux.zip "${folder}"
+          7z a Twitch.Drops.Miner.Linux.PyInstaller.zip "${folder}"
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           if-no-files-found: error
-          name: Twitch.Drops.Miner.Linux
-          path: Twitch.Drops.Miner.Linux.zip
+          name: Twitch.Drops.Miner.Linux.PyInstaller
+          path: Twitch.Drops.Miner.Linux.PyInstaller.zip
+
+  linux-appimage:
+    name: Linux (AppImage)
+    runs-on: ubuntu-22.04
+    needs:
+      - validate
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up variables
+        id: vars
+        run: |
+          echo "app_version=$(python3 -c 'from version import __version__ as v; print(v)')" >> "${GITHUB_OUTPUT}"
+          echo "sha_short=$(git rev-parse --short HEAD)" >> "${GITHUB_OUTPUT}"
+
+      - name: Append git revision to project version
+        run: |
+          sed -ri "s/^__version__\s*=\s*\"[^\"]+/\0.${{steps.vars.outputs.sha_short}}/" version.py
+
+      - name: Install system dependencies
+        run: |
+          sudo apt update
+          sudo apt install libgirepository1.0-dev gir1.2-ayatanaappindicator3-0.1 libayatana-appindicator3-1 python3-testresources
+
+      - name: Download AppImage Builder
+        run: |
+          curl -L https://github.com/AppImageCrafters/appimage-builder/releases/download/v1.1.0/appimage-builder-1.1.0-x86_64.AppImage -o appimage-builder
+          chmod +x appimage-builder
+
+      - name: Create AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
+          APP_VERSION: ${{steps.vars.outputs.app_version}}.${{steps.vars.outputs.sha_short}}
+          PYTHON_VERSION: ${{env.PYTHON_VERSION}}
+        run: |
+          ./appimage-builder --recipe appimage/AppImageBuilder.yml
+
+      - name: Create release folder
+        run: |
+          folder='Twitch Drops Miner'
+          mkdir "${folder}"
+          cp *.AppImage manual.txt "${folder}"
+          7z a Twitch.Drops.Miner.Linux.AppImage.zip "${folder}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          if-no-files-found: error
+          name: Twitch.Drops.Miner.Linux.AppImage
+          path: Twitch.Drops.Miner.Linux.AppImage.zip
 
   update_releases_page:
     name: Upload builds to Releases
     if: github.event_name != 'pull_request'
     needs:
       - windows
-      - linux
-    runs-on: ubuntu-22.04
+      - linux-pyinstaller
+      - linux-appimage
+    runs-on: ubuntu-latest
     permissions:
       contents: write
 
@@ -160,11 +245,16 @@ jobs:
           echo "date_now=$(date --rfc-3339=seconds)" >> "${GITHUB_OUTPUT}"
 
       - name: Download build artifacts from previous jobs
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Upload builds to Releases
+      - name: Delete the existing pre-release
+        run: gh release delete dev-build --cleanup-tag --yes --repo $GITHUB_REPOSITORY
+        env:
+          GITHUB_TOKEN: ${{github.token}}
+
+      - name: Create a new dev build release
         uses: ncipollo/release-action@v1
         with:
           allowUpdates: true
@@ -175,8 +265,8 @@ jobs:
             **⚠️ This build is not stable and may end up terminating with a fatal error. ⚠️**
             **Use at your own risk.**
 
-            - Last build date: `${{ steps.vars.outputs.date_now }}`
-            - Reference commit: ${{ github.sha }}
+            - Last build date: `${{steps.vars.outputs.date_now}}`
+            - Reference commit: ${{github.sha}}
           name: Development build
           prerelease: true
           removeArtifacts: true
